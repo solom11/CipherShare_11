@@ -3,11 +3,18 @@ import threading
 import os
 import hashlib
 import secrets
+import sys
+import shutil
+from tkinter import Tk, filedialog
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.backends import default_backend
 
 SHARED_FOLDER = "shared_files"
 DEFAULT_PEER_PORT = 5001
 REGISTRY_IP = "127.0.0.1"
 REGISTRY_PORT = 6000
+AES_KEY = b"thisisaverysecretkeylolzzz!!!!!!"
 
 if not os.path.exists(SHARED_FOLDER):
     os.makedirs(SHARED_FOLDER)
@@ -15,7 +22,8 @@ if not os.path.exists(SHARED_FOLDER):
 users = {}  # username -> (hashed_password, salt)
 logged_in_users = set()
 local_port = None
-logged_in_user = None 
+logged_in_user = None
+file_hashes = {}  # filename -> sha256 hash
 
 
 def hash_password(password, salt=None):
@@ -23,6 +31,60 @@ def hash_password(password, salt=None):
         salt = secrets.token_bytes(16)
     hashed = hashlib.sha256(salt + password.encode()).hexdigest()
     return hashed, salt
+
+
+def encrypt_file(filepath):
+    backend = default_backend()
+    iv = secrets.token_bytes(16)
+    cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(iv), backend=backend)
+    encryptor = cipher.encryptor()
+
+    with open(filepath, "rb") as f:
+        data = f.read()
+    padder = padding.PKCS7(128).padder()
+    padded_data = padder.update(data) + padder.finalize()
+    encrypted = encryptor.update(padded_data) + encryptor.finalize()
+
+    with open(filepath, "wb") as f:
+        f.write(iv + encrypted)
+
+
+def decrypt_file(filepath):
+    backend = default_backend()
+    with open(filepath, "rb") as f:
+        iv = f.read(16)
+        encrypted = f.read()
+
+    cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(iv), backend=backend)
+    decryptor = cipher.decryptor()
+    decrypted = decryptor.update(encrypted) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    unpadded_data = unpadder.update(decrypted) + unpadder.finalize()
+
+    with open(filepath, "wb") as f:
+        f.write(unpadded_data)
+
+
+def hash_file(filepath):
+    sha256 = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+
+def select_and_upload_file():
+    root = Tk()
+    root.withdraw()
+    file_path = filedialog.askopenfilename()
+    if file_path:
+        filename = os.path.basename(file_path)
+        dest_path = os.path.join(SHARED_FOLDER, filename)
+        shutil.copy(file_path, dest_path)
+        original_hash = hash_file(dest_path)
+        file_hashes[filename] = original_hash
+        encrypt_file(dest_path)
+        print(f"File '{filename}' uploaded, encrypted, and hash stored.")
 
 
 def register_with_registry(username, ip, port):
@@ -87,10 +149,14 @@ def handle_client_connection(client_socket, client_address):
                 filepath = os.path.join(SHARED_FOLDER, filename)
                 if os.path.exists(filepath):
                     client_socket.send(b"FOUND")
+                    filesize = os.path.getsize(filepath)
+                    client_socket.send(str(filesize).encode().ljust(16))
                     with open(filepath, "rb") as f:
                         while chunk := f.read(1024):
                             client_socket.send(chunk)
-                    client_socket.send(b"EOF")
+                    filename = os.path.basename(filepath)
+                    file_hash = file_hashes.get(filename, "0" * 64)
+                    client_socket.send(file_hash.encode())
                 else:
                     client_socket.send(b"NOTFOUND")
             else:
@@ -133,9 +199,15 @@ def check_peer_online(ip, port, username):
 def connect_to_peers():
     global logged_in_user
     while True:
-        print(
-            "\n1. Register\n2. Login\n3. Connect to another peer by username\n4. List files\n5. Download file\n6. "
-            "Logout\n7. Exit")
+        print("\n1. Register")
+        print("2. Login")
+        print("3. Connect to another peer")
+        print("4. Upload a file")
+        print("5. List shared files")
+        print("6. Download file")
+        print("7. Logout")
+        print("8. Exit")
+
         choice = input("Select option: ")
 
         if choice == "1":
@@ -199,14 +271,31 @@ def connect_to_peers():
                         ps.send(f"DOWNLOAD {filename}".encode())
                         status = ps.recv(1024)
                         if status == b"FOUND":
+                            size_data = b""
+                            while len(size_data) < 16:
+                                size_data += ps.recv(16 - len(size_data))
+                            filesize = int(size_data.strip())
+                            received = 0
                             with open(filename, "wb") as f:
-                                while True:
-                                    chunk = ps.recv(1024)
-                                    if chunk.endswith(b"EOF"):
-                                        f.write(chunk[:-3])
+                                while received < filesize:
+                                    chunk = ps.recv(min(1024, filesize - received))
+                                    if not chunk:
                                         break
                                     f.write(chunk)
-                            print("Download complete.")
+                                    received += len(chunk)
+                            if received == filesize:
+                                try:
+                                    decrypt_file(filename)
+                                    downloaded_hash = hash_file(filename)
+                                    expected_hash = ps.recv(64).decode()
+                                    if downloaded_hash == expected_hash:
+                                        print("Download complete, file decrypted, and integrity verified.")
+                                    else:
+                                        print("Download complete and decrypted, but WARNING: integrity check failed!")
+                                except ValueError as e:
+                                    print("Decryption failed:", e)
+                            else:
+                                print("Download incomplete. File may be corrupted.")
                         else:
                             print("File not found.")
 
@@ -217,13 +306,19 @@ def connect_to_peers():
             if not logged_in_user:
                 print("You must login first.")
                 continue
+            select_and_upload_file()
+
+        elif choice == "5":
+            if not logged_in_user:
+                print("You must login first.")
+                continue
             files = os.listdir(SHARED_FOLDER)
             print("Local shared files:\n" + "\n".join(files))
 
-        elif choice == "5":
+        elif choice == "6":
             print("Use option 3 to connect to a peer first to download.")
 
-        elif choice == "6":
+        elif choice == "7":
             if logged_in_user:
                 print(f"User '{logged_in_user}' logged out.")
                 logged_in_users.discard(logged_in_user)
@@ -231,7 +326,7 @@ def connect_to_peers():
             else:
                 print("No user is currently logged in.")
 
-        elif choice == "7":
+        elif choice == "8":
             print("Exiting...")
             os._exit(0)
 
