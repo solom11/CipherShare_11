@@ -3,7 +3,6 @@ import threading
 import os
 import hashlib
 import secrets
-import sys
 import shutil
 from tkinter import Tk, filedialog
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -14,7 +13,6 @@ SHARED_FOLDER = "shared_files"
 DEFAULT_PEER_PORT = 5001
 REGISTRY_IP = "127.0.0.1"
 REGISTRY_PORT = 6000
-AES_KEY = b"thisisaverysecretkeylolzzz!!!!!!"
 
 if not os.path.exists(SHARED_FOLDER):
     os.makedirs(SHARED_FOLDER)
@@ -25,6 +23,15 @@ local_port = None
 logged_in_user = None
 file_hashes = {}  # filename -> sha256 hash
 
+# For Diffie-Hellman key exchange
+DH_PRIME = 0xFFFFFFFB
+DH_GENERATOR = 5
+file_keys = {}  # filename -> AES key
+
+
+def xor_bytes(a, b):
+    return bytes(x ^ y for x, y in zip(a, b))
+
 
 def hash_password(password, salt=None):
     if not salt:
@@ -33,10 +40,10 @@ def hash_password(password, salt=None):
     return hashed, salt
 
 
-def encrypt_file(filepath):
+def encrypt_file(filepath, key):
     backend = default_backend()
     iv = secrets.token_bytes(16)
-    cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(iv), backend=backend)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=backend)
     encryptor = cipher.encryptor()
 
     with open(filepath, "rb") as f:
@@ -49,13 +56,13 @@ def encrypt_file(filepath):
         f.write(iv + encrypted)
 
 
-def decrypt_file(filepath):
+def decrypt_file(filepath, key):
     backend = default_backend()
     with open(filepath, "rb") as f:
         iv = f.read(16)
         encrypted = f.read()
 
-    cipher = Cipher(algorithms.AES(AES_KEY), modes.CBC(iv), backend=backend)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=backend)
     decryptor = cipher.decryptor()
     decrypted = decryptor.update(encrypted) + decryptor.finalize()
     unpadder = padding.PKCS7(128).unpadder()
@@ -81,10 +88,19 @@ def select_and_upload_file():
         filename = os.path.basename(file_path)
         dest_path = os.path.join(SHARED_FOLDER, filename)
         shutil.copy(file_path, dest_path)
+
+        # Store hash for integrity verification
         original_hash = hash_file(dest_path)
         file_hashes[filename] = original_hash
-        encrypt_file(dest_path)
-        print(f"File '{filename}' uploaded, encrypted, and hash stored.")
+
+        # Generate and store a random AES key for this file
+        aes_key = secrets.token_bytes(32)
+        file_keys[filename] = aes_key
+
+        # Encrypt using the file-specific key
+        encrypt_file(dest_path, aes_key)
+
+        print(f"File '{filename}' uploaded, encrypted with unique key, and hash stored.")
 
 
 def register_with_registry(username, ip, port):
@@ -149,6 +165,20 @@ def handle_client_connection(client_socket, client_address):
                 filepath = os.path.join(SHARED_FOLDER, filename)
                 if os.path.exists(filepath):
                     client_socket.send(b"FOUND")
+                    # --- Diffie-Hellman key exchange with the requester ---
+                    private = secrets.randbelow(DH_PRIME)
+                    public = pow(DH_GENERATOR, private, DH_PRIME)
+                    client_socket.send(str(public).encode().ljust(64))
+                    peer_pub = int(client_socket.recv(64).strip())
+                    shared = pow(peer_pub, private, DH_PRIME)
+                    shared_key = hashlib.sha256(str(shared).encode()).digest()
+
+                    # --- Encrypt the AES file key and send it ---
+                    filename = os.path.basename(filepath)
+                    file_key = file_keys.get(filename)
+                    encrypted_file_key = xor_bytes(file_key, shared_key)
+                    client_socket.send(encrypted_file_key)
+
                     filesize = os.path.getsize(filepath)
                     client_socket.send(str(filesize).encode().ljust(16))
                     with open(filepath, "rb") as f:
@@ -271,6 +301,18 @@ def connect_to_peers():
                         ps.send(f"DOWNLOAD {filename}".encode())
                         status = ps.recv(1024)
                         if status == b"FOUND":
+                            # --- Diffie-Hellman key exchange ---
+                            private = secrets.randbelow(DH_PRIME)
+                            peer_pub = int(ps.recv(64).strip())
+                            public = pow(DH_GENERATOR, private, DH_PRIME)
+                            ps.send(str(public).encode().ljust(64))
+                            shared = pow(peer_pub, private, DH_PRIME)
+                            shared_key = hashlib.sha256(str(shared).encode()).digest()
+
+                            # --- Receive and decrypt AES file key ---
+                            encrypted_file_key = ps.recv(32)
+                            file_key = xor_bytes(encrypted_file_key, shared_key)
+
                             size_data = b""
                             while len(size_data) < 16:
                                 size_data += ps.recv(16 - len(size_data))
@@ -285,9 +327,12 @@ def connect_to_peers():
                                     received += len(chunk)
                             if received == filesize:
                                 try:
-                                    decrypt_file(filename)
+                                    decrypt_file(filename, file_key)
                                     downloaded_hash = hash_file(filename)
-                                    expected_hash = ps.recv(64).decode()
+                                    expected_hash = b""
+                                    while len(expected_hash) < 64:
+                                        expected_hash += ps.recv(64 - len(expected_hash))
+                                    expected_hash = expected_hash.decode()
                                     if downloaded_hash == expected_hash:
                                         print("Download complete, file decrypted, and integrity verified.")
                                     else:
