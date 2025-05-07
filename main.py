@@ -4,24 +4,36 @@ import os
 import hashlib
 import secrets
 import shutil
+import pickle
+import time
 from tkinter import Tk, filedialog
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from argon2 import PasswordHasher
 
 SHARED_FOLDER = "shared_files"
+CREDENTIAL_FILE = "user_credentials.enc"
 DEFAULT_PEER_PORT = 5001
 REGISTRY_IP = "127.0.0.1"
 REGISTRY_PORT = 6000
+BROADCAST_PORT = 7000
+BROADCAST_INTERVAL = 10
 
 if not os.path.exists(SHARED_FOLDER):
     os.makedirs(SHARED_FOLDER)
 
-users = {}  # username -> (hashed_password, salt)
+users = {}  # username -> hashed_password (Argon2)
 logged_in_users = set()
 local_port = None
 logged_in_user = None
 file_hashes = {}  # filename -> sha256 hash
+user_keys = {}  # username -> encryption key in memory only
+peer_file_index = {}  # username -> (file list, IP)
+argon2_hasher = PasswordHasher()
+backend = default_backend()
 
 # For Diffie-Hellman key exchange
 DH_PRIME = 0xFFFFFFFB
@@ -33,11 +45,103 @@ def xor_bytes(a, b):
     return bytes(x ^ y for x, y in zip(a, b))
 
 
-def hash_password(password, salt=None):
-    if not salt:
-        salt = secrets.token_bytes(16)
-    hashed = hashlib.sha256(salt + password.encode()).hexdigest()
-    return hashed, salt
+def listen_for_broadcasts():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", local_port + 2000))
+    print(f"[*] Listening for file broadcasts on UDP {local_port + 2000}...")
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(4096)
+            message = data.decode()
+            parts = message.split("||")
+            if len(parts) >= 2:
+                username = parts[0]
+                files = parts[1:]
+                peer_file_index[username] = (files, addr[0])
+        except Exception as e:
+            print(f"[!] Broadcast receive error: {e}")
+
+
+def broadcast_files(username):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    while True:
+        if username in logged_in_users:
+            files = os.listdir(SHARED_FOLDER)
+            message = "||".join([username] + files).encode()
+
+            for port in range(5001, 5011):
+                if port != local_port:
+                    sock.sendto(message, ("127.0.0.1", port + 2000))
+        time.sleep(BROADCAST_INTERVAL)
+
+
+
+def derive_key_from_password(password, salt, length=32):
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=length,
+        salt=salt,
+        iterations=100_000,
+        backend=backend,
+    )
+    return kdf.derive(password.encode())
+
+
+def encrypt_data(data: bytes, key: bytes):
+    iv = secrets.token_bytes(16)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=backend)
+    encryptor = cipher.encryptor()
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(data) + padder.finalize()
+    return iv + encryptor.update(padded) + encryptor.finalize()
+
+
+def decrypt_data(enc_data: bytes, key: bytes):
+    iv = enc_data[:16]
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=backend)
+    decryptor = cipher.decryptor()
+    decrypted = decryptor.update(enc_data[16:]) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    return unpadder.update(decrypted) + unpadder.finalize()
+
+
+def load_user_credentials(master_password):
+    global users
+    if not os.path.exists(CREDENTIAL_FILE):
+        return False
+    with open(CREDENTIAL_FILE, "rb") as f:
+        salt = f.read(16)
+        encrypted = f.read()
+        key = derive_key_from_password(master_password, salt)
+        try:
+            decrypted = decrypt_data(encrypted, key)
+            users.update(pickle.loads(decrypted))
+            return True
+        except Exception:
+            print("[!] Failed to decrypt credentials. Wrong master password?")
+            return False
+
+
+def save_user_credentials(master_password):
+    salt = secrets.token_bytes(16)
+    key = derive_key_from_password(master_password, salt)
+    serialized = pickle.dumps(users)
+    encrypted = encrypt_data(serialized, key)
+    with open(CREDENTIAL_FILE, "wb") as f:
+        f.write(salt + encrypted)
+
+
+def hash_password(password):
+    return argon2_hasher.hash(password)
+
+
+def verify_password(hashed_password, input_password):
+    try:
+        return argon2_hasher.verify(hashed_password, input_password)
+    except Exception:
+        return False
 
 
 def encrypt_file(filepath, key):
@@ -89,15 +193,15 @@ def select_and_upload_file():
         dest_path = os.path.join(SHARED_FOLDER, filename)
         shutil.copy(file_path, dest_path)
 
-        # Store hash for integrity verification
         original_hash = hash_file(dest_path)
         file_hashes[filename] = original_hash
 
-        # Generate and store a random AES key for this file
-        aes_key = secrets.token_bytes(32)
+        aes_key = user_keys.get(logged_in_user)
+        if not aes_key:
+            print("Encryption key not found for user.")
+            return
         file_keys[filename] = aes_key
 
-        # Encrypt using the file-specific key
         encrypt_file(dest_path, aes_key)
 
         print(f"File '{filename}' uploaded, encrypted with unique key, and hash stored.")
@@ -130,9 +234,8 @@ def handle_client_connection(client_socket, client_address):
                 if uname not in users:
                     client_socket.send(b"NO_USER")
                 else:
-                    stored_hash, salt = users[uname]
-                    input_hash, _ = hash_password(passwd, salt)
-                    if input_hash == stored_hash:
+                    stored_hash = users[uname]
+                    if verify_password(stored_hash, passwd):
                         logged_in_users.add(uname)
                         client_socket.send(b"LOGIN_SUCCESS")
                     else:
@@ -165,7 +268,6 @@ def handle_client_connection(client_socket, client_address):
                 filepath = os.path.join(SHARED_FOLDER, filename)
                 if os.path.exists(filepath):
                     client_socket.send(b"FOUND")
-                    # --- Diffie-Hellman key exchange with the requester ---
                     private = secrets.randbelow(DH_PRIME)
                     public = pow(DH_GENERATOR, private, DH_PRIME)
                     client_socket.send(str(public).encode().ljust(64))
@@ -173,7 +275,6 @@ def handle_client_connection(client_socket, client_address):
                     shared = pow(peer_pub, private, DH_PRIME)
                     shared_key = hashlib.sha256(str(shared).encode()).digest()
 
-                    # --- Encrypt the AES file key and send it ---
                     filename = os.path.basename(filepath)
                     file_key = file_keys.get(filename)
                     encrypted_file_key = xor_bytes(file_key, shared_key)
@@ -200,9 +301,14 @@ def handle_client_connection(client_socket, client_address):
 
 def start_peer():
     global local_port
+    print("=== Startup ===")
+    master_pass = input("Enter your master password: ")
+    if not load_user_credentials(master_pass):
+        print("Starting with empty user database.")
+
     local_port = int(input("Enter your peer's listening port: "))
     threading.Thread(target=start_peer_server, args=(local_port,)).start()
-    connect_to_peers()
+    connect_to_peers(master_pass)
 
 
 def start_peer_server(port):
@@ -226,7 +332,7 @@ def check_peer_online(ip, port, username):
         return False
 
 
-def connect_to_peers():
+def connect_to_peers(master_pass):
     global logged_in_user
     while True:
         print("\n1. Register")
@@ -234,7 +340,7 @@ def connect_to_peers():
         print("3. Connect to another peer")
         print("4. Upload a file")
         print("5. List shared files")
-        print("6. Download file")
+        print("6. View discovered files")
         print("7. Logout")
         print("8. Exit")
 
@@ -243,21 +349,33 @@ def connect_to_peers():
         if choice == "1":
             uname = input("Username: ")
             passwd = input("Password: ")
-            hashed, salt = hash_password(passwd)
-            users[uname] = (hashed, salt)
-            result = register_with_registry(uname, "127.0.0.1", local_port)
-            print(result)
+            if uname in users:
+                print("Username already exists.")
+            else:
+                hashed = hash_password(passwd)
+                users[uname] = hashed
+                user_keys[uname] = derive_key_from_password(passwd, uname.encode())
+                save_user_credentials(master_pass)
+                result = register_with_registry(uname, "127.0.0.1", local_port)
+                print(result)
 
         elif choice == "2":
             uname = input("Username: ")
             passwd = input("Password: ")
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect(("127.0.0.1", local_port))
-                s.send(f"LOGIN {uname} {passwd}".encode())
-                resp = s.recv(1024)
-                print(resp.decode())
-                if resp == b"LOGIN_SUCCESS":
-                    logged_in_user = uname
+            if uname in users and verify_password(users[uname], passwd):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.connect(("127.0.0.1", local_port))
+                    s.send(f"LOGIN {uname} {passwd}".encode())
+                    resp = s.recv(1024)
+                    print(resp.decode())
+                    if resp == b"LOGIN_SUCCESS":
+                        logged_in_user = uname
+                        user_keys[uname] = derive_key_from_password(passwd, uname.encode())
+                        result = register_with_registry(uname, "127.0.0.1", local_port)
+                        print(result)
+                        threading.Thread(target=listen_for_broadcasts, daemon=True).start()
+                        threading.Thread(target=broadcast_files, args=(uname,), daemon=True).start()
+
 
         elif choice == "3":
             if not logged_in_user:
@@ -301,7 +419,6 @@ def connect_to_peers():
                         ps.send(f"DOWNLOAD {filename}".encode())
                         status = ps.recv(1024)
                         if status == b"FOUND":
-                            # --- Diffie-Hellman key exchange ---
                             private = secrets.randbelow(DH_PRIME)
                             peer_pub = int(ps.recv(64).strip())
                             public = pow(DH_GENERATOR, private, DH_PRIME)
@@ -309,7 +426,6 @@ def connect_to_peers():
                             shared = pow(peer_pub, private, DH_PRIME)
                             shared_key = hashlib.sha256(str(shared).encode()).digest()
 
-                            # --- Receive and decrypt AES file key ---
                             encrypted_file_key = ps.recv(32)
                             file_key = xor_bytes(encrypted_file_key, shared_key)
 
@@ -361,7 +477,11 @@ def connect_to_peers():
             print("Local shared files:\n" + "\n".join(files))
 
         elif choice == "6":
-            print("Use option 3 to connect to a peer first to download.")
+            print("Discovered files from other peers:")
+            for peer, (files, ip) in peer_file_index.items():
+                print(f"\nPeer: {peer} ({ip})")
+                for f in files:
+                    print(f"  - {f}")
 
         elif choice == "7":
             if logged_in_user:
